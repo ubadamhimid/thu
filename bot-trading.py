@@ -1,111 +1,133 @@
-import requests
-import time
+import ccxt
 import pandas as pd
-import numpy as np
-import joblib
-import asyncio
-import threading
-from sklearn.linear_model import LogisticRegression
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+import time
+import requests
+import random
+import matplotlib.pyplot as plt
+from ta.trend import SMAIndicator
+from ta.momentum import RSIIndicator
 
-# إعدادات KuCoin API
-KUCOIN_API_URL = "https://api.kucoin.com/api/v1/market/allTickers"
+# --- إعداد مفاتيح API ---
+api_key = "67c5f96745e41a00016725dc"
+api_secret = "18bfe368-9bdb-4e91-abf6-c41eae7ef8fe"
+api_passphrase = "Voetbal10!"
+telegram_bot_token = "7305418909:AAGOeDSbhc7ugfjyIlzGJm4M_Acpb07cKFk"
+telegram_chat_id = "1638104695"
 
-# إعدادات تيليجرام
-TELEGRAM_BOT_TOKEN = "7305418909:AAGOeDSbhc7ugfjyIlzGJm4M_Acpb07cKFk"
-CHAT_ID = "1638104695"
-bot = Bot(token=TELEGRAM_BOT_TOKEN)
+# --- الاتصال بمنصة KuCoin ---
+exchange = ccxt.kucoin({
+    'apiKey': api_key,
+    'secret': api_secret,
+    'password': api_passphrase,
+    'enableRateLimit': True,
+    'options': {'defaultType': 'spot'}
+})
 
-# تشغيل asyncio في Thread منفصل
-def start_async_loop(loop):
-    asyncio.set_event_loop(loop)
-    loop.run_forever()
+# --- جلب جميع أزواج USDT ---
+def get_all_usdt_pairs():
+    tickers = exchange.fetch_tickers()
+    usdt_pairs = [symbol for symbol in tickers if symbol.endswith("/USDT")]
+    return usdt_pairs
 
-async_loop = asyncio.new_event_loop()
-t = threading.Thread(target=start_async_loop, args=(async_loop,), daemon=True)
-t.start()
+# --- إعدادات التداول ---
+trading_pairs = get_all_usdt_pairs()
 
-# جلب بيانات السوق
-def get_market_data():
-    response = requests.get(KUCOIN_API_URL)
-    if response.status_code != 200:
-        return []
-    data = response.json()
-    return data.get("data", {}).get("ticker", [])
+def send_telegram_message(message):
+    """إرسال إشعار نصي إلى تيليجرام"""
+    url = f"https://api.telegram.org/bot{telegram_bot_token}/sendMessage"
+    payload = {"chat_id": telegram_chat_id, "text": message}
+    requests.post(url, data=payload)
 
-# تحليل العملات
+def send_telegram_photo(photo_path):
+    """إرسال صورة إلى تيليجرام"""
+    url = f"https://api.telegram.org/bot{telegram_bot_token}/sendPhoto"
+    files = {"photo": open(photo_path, "rb")}
+    data = {"chat_id": telegram_chat_id}
+    requests.post(url, files=files, data=data)
 
-def get_top_coins(data):
-    df = pd.DataFrame(data)
-    if df.empty:
-        return df
-    df['changeRate'] = pd.to_numeric(df['changeRate'], errors='coerce').fillna(0) * 100
-    df['volValue'] = pd.to_numeric(df['volValue'], errors='coerce').fillna(0)
-    top_50 = df.nlargest(50, ['changeRate', 'volValue'])
-    return top_50[['symbol', 'changeRate', 'last', 'high', 'low', 'volValue']]
-
-# تحليل الصفقات
-
-def analyze_coin(symbol, last_price, high_price, low_price, volume):
-    resistance = float(high_price)
-    support = float(low_price)
-    take_profit = float(last_price) * 1.03
-    stop_loss = float(last_price) * 0.97
-    return resistance, support, take_profit, stop_loss
-
-# تتبع الصفقات
-open_trades = {}
-trade_stats = {"wins": 0, "losses": 0, "total": 0}
-
-def update_data():
-    global open_trades, trade_stats
+def fetch_market_data(symbol, timeframe='1h', limit=100):
+    """جلب بيانات السوق مع التعامل مع الأخطاء"""
     try:
-        market_data = get_market_data()
-        if not market_data:
-            return
-        top_50_coins = get_top_coins(market_data)
-        if top_50_coins.empty:
-            return
-        
-        for _, row in top_50_coins.iterrows():
-            symbol = row['symbol']
-            last_price = float(row['last'])
-            high_price = float(row['high'])
-            low_price = float(row['low'])
-            volume = float(row['volValue'])
-            
-            resistance, support, take_profit, stop_loss = analyze_coin(symbol, last_price, high_price, low_price, volume)
-            
-            if symbol not in open_trades:
-                open_trades[symbol] = {"entry": last_price, "take_profit": take_profit, "stop_loss": stop_loss}
-                asyncio.run_coroutine_threadsafe(
-                    bot.send_message(chat_id=CHAT_ID, text=f"🔔 دخول صفقة {symbol} بسعر {last_price}"), async_loop
-                )
-            
-            trade = open_trades[symbol]
-            if last_price >= trade["take_profit"]:
-                trade_stats["wins"] += 1
-                asyncio.run_coroutine_threadsafe(
-                    bot.send_message(chat_id=CHAT_ID, text=f"✅ {symbol} حققت الهدف عند {trade['take_profit']}"), async_loop
-                )
-                del open_trades[symbol]
-            elif last_price <= trade["stop_loss"]:
-                trade_stats["losses"] += 1
-                asyncio.run_coroutine_threadsafe(
-                    bot.send_message(chat_id=CHAT_ID, text=f"❌ {symbol} ضرب وقف الخسارة عند {trade['stop_loss']}"), async_loop
-                )
-                del open_trades[symbol]
-            
-        trade_stats["total"] = trade_stats["wins"] + trade_stats["losses"]
-        if trade_stats["total"] % 20 == 0:  # تحديث الإحصائيات كل 20 صفقة
-            asyncio.run_coroutine_threadsafe(
-                bot.send_message(chat_id=CHAT_ID, text=f"📊 الإحصائيات: {trade_stats['wins']} ربح / {trade_stats['losses']} خسارة"), async_loop
-            )
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        return df
     except Exception as e:
-        print(f"❌ خطأ أثناء التحديث: {e}")
+        error_message = f"⚠ حدث خطأ أثناء جلب بيانات {symbol}: {e}"
+        print(error_message)
+        send_telegram_message(error_message)
+        return None
 
-# تشغيل التحديث التلقائي كل 15 دقيقة لمدة 5 ساعات
-start_time = time.time()
-while time.time() - start_time < 18000:  # 18000 ثانية = 5 ساعات
-    update_data()
-    time.sleep(900)
+def apply_indicators(df):
+    """إضافة المؤشرات الفنية"""
+    df['SMA50'] = SMAIndicator(df['close'], window=50).sma_indicator()
+    df['SMA200'] = SMAIndicator(df['close'], window=200).sma_indicator()
+    df['RSI'] = RSIIndicator(df['close'], window=14).rsi()
+    df['Resistance'] = df['high'].rolling(window=20).max()
+    df['Support'] = df['low'].rolling(window=20).min()
+    return df
+
+def generate_trade_signal(df):
+    """تحديد إشارات الدخول والخروج وإضافة الهدف والستوب"""
+    latest = df.iloc[-1]
+    previous = df.iloc[-2]
+    target_price = None
+    stop_loss_price = None
+
+    if latest['SMA50'] > latest['SMA200'] and previous['RSI'] < 30 and latest['RSI'] > 30:
+        target_price = latest['close'] * 1.05  # هدف 5%
+        stop_loss_price = latest['close'] * 0.95  # ستوب 5%
+        return 'BUY', target_price, stop_loss_price
+    elif latest['SMA50'] < latest['SMA200'] and previous['RSI'] > 70 and latest['RSI'] < 70:
+        target_price = latest['close'] * 0.95  # هدف 5%
+        stop_loss_price = latest['close'] * 1.05  # ستوب 5%
+        return 'SELL', target_price, stop_loss_price
+    return None, None, None
+
+def plot_and_send_chart(df, symbol):
+    """رسم المخطط البياني وإرساله إلى تيليجرام"""
+    plt.figure(figsize=(10, 5))
+    plt.plot(df['timestamp'], df['close'], label='Close Price', color='blue')
+    plt.plot(df['timestamp'], df['SMA50'], label='SMA50', color='orange')
+    plt.plot(df['timestamp'], df['SMA200'], label='SMA200', color='red')
+    plt.title(f"{symbol} Price Chart")
+    plt.xlabel("Time")
+    plt.ylabel("Price")
+    plt.legend()
+    plt.grid()
+    plt.savefig("chart.png")
+    plt.close()
+    send_telegram_photo("chart.png")
+
+def main():
+    """تشغيل البوت بشكل دوري لجميع العملات USDT دون تنفيذ الصفقات"""
+    while True:
+        try:
+            for symbol in trading_pairs:
+                df = fetch_market_data(symbol)
+                if df is None or df.empty:
+                    print(f"⚠ تخطي {symbol} بسبب عدم توفر بيانات السوق")
+                    continue
+                df = apply_indicators(df)
+                signal, target, stop_loss = generate_trade_signal(df)
+
+                if signal:
+                    message = f"🔔 إشارة تداول {signal} لزوج {symbol}\n" \
+                              f"📊 السعر الحالي: {df['close'].iloc[-1]}\n" \
+                              f"🎯 الهدف: {target}\n" \
+                              f"🛑 وقف الخسارة: {stop_loss}\n" \
+                              f"📈 SMA50: {df['SMA50'].iloc[-1]}\n" \
+                              f"📉 SMA200: {df['SMA200'].iloc[-1]}\n" \
+                              f"💹 RSI: {df['RSI'].iloc[-1]}"
+                    send_telegram_message(message)
+                    plot_and_send_chart(df, symbol)
+
+            time.sleep(random.randint(30, 60))
+        except Exception as e:
+            error_message = f"⚠ حدث خطأ: {e}"
+            print(error_message)
+            send_telegram_message(error_message)
+            time.sleep(60)
+
+if __name__ == "__main__":
+    main()
